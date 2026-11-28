@@ -1473,8 +1473,9 @@ private:
     std::vector<RelocatedUniform*> flush_uniform_candidates_;
     std::vector<RelocatedStorage*> flush_storage_candidates_;
     // A relocated storage range an indexed flush hashes without storage_relocation_mutex_: taken under
-    // the lock (write marks, cursor), hashed / copied after letting go, applied under it again if the
-    // entry is still the same one (key, address and created_epoch), then encoded outside it.
+    // the lock (write marks, cursor), hashed after letting go (and, when changed, encoded straight from
+    // the guest view into the flush's encoder: one copy), applied under it again if the entry is still
+    // the same one (key, address and created_epoch); a stale entry's packets are patched to Nops.
     struct StorageHashJob {
         RelocatedStorage* entry = nullptr;
         uint64_t va = 0, size = 0;
@@ -1489,11 +1490,12 @@ private:
         bool read_ok = false;
         bool changed = false;
         uint64_t hash = 0;
-        std::vector<uint8_t> bytes;  // the new bytes (padded to 4) when changed
+        std::vector<uint8_t> bytes;  // the bytes read when the range is not mapped in one piece
+        uint32_t buffer_id = 0;      // the entry's home (fixed for an entry with this created_epoch)
+        uint64_t offset = 0;
+        size_t packets_begin = 0, packets_end = 0;  // its WriteBuffer packets in the flush encoder
         // Filled when applied.
         bool upload = false;
-        uint32_t buffer_id = 0;
-        uint64_t offset = 0;
     };
     std::vector<StorageHashJob> flush_storage_jobs_;  // reused; the first flush_storage_job_count_ are live
     size_t flush_storage_job_count_ = 0;

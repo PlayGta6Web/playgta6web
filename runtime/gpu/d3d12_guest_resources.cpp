@@ -3088,6 +3088,9 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                 job.taken_host = seen_host;
                 job.ever_uploaded = r.ever_uploaded;
                 job.last_hash = r.last_hash;
+                job.buffer_id = r.buffer_id;
+                job.offset = r.offset;
+                job.packets_begin = job.packets_end = 0;
                 job.upload = false;
                 return;
             }
@@ -3143,34 +3146,92 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                 // and cursors were taken above, before the bytes are read, as on the locked path: a write
                 // racing the hash is reported to the next flush.
                 lock.unlock();
-                for (size_t i = 0; i < flush_storage_job_count_; ++i) {
-                    StorageHashJob& job = flush_storage_jobs_[i];
-                    job.host = 0;
-                    job.read_ok = false;
-                    job.changed = false;
-                    {
-                        const com::GuestRangeView view(job.cpu, static_cast<size_t>(job.size));
+                // A changed range is encoded straight from the bytes it was hashed from (one copy, while
+                // they are still in cache) to the home taken under the lock; the packets of an entry found
+                // stale when applying are patched to Nops below.
+                const auto encode_job = [&](StorageHashJob& job, const uint8_t* src) {
+                    const uint64_t write_len = align_up(job.size, 4u);
+                    job.packets_begin = encoder.size();
+                    for (uint64_t off = 0; off < write_len; off += kMaxWriteChunk) {
+                        const uint64_t n = std::min<uint64_t>(kMaxWriteChunk, write_len - off);
+                        const uint8_t* chunk = src + off;
+                        if (off + n > job.size) {  // the last chunk, padded to 4 with zeros
+                            flush_bytes_scratch_.assign(static_cast<size_t>(n), 0);
+                            std::memcpy(flush_bytes_scratch_.data(), src + off, static_cast<size_t>(job.size - off));
+                            chunk = flush_bytes_scratch_.data();
+                        }
+                        encoder.write_buffer(job.buffer_id, static_cast<uint32_t>(job.offset + off), chunk,
+                                             static_cast<uint32_t>(n));
+                    }
+                    job.packets_end = encoder.size();
+                };
+                const auto hash_job = [&](StorageHashJob& job, const uint8_t* host) {
+                    job.host = reinterpret_cast<uintptr_t>(host);
+                    job.read_ok = true;
+                    job.hash = content_hash(host, static_cast<size_t>(job.size));
+                    job.changed = !job.ever_uploaded || job.hash != job.last_hash;
+                    if (job.changed) {
+                        encode_job(job, host);
+                    }
+                };
+                // The jobs are in guest VA order: neighbouring ranges share one view (one arena lock round
+                // trip) when their span is mapped in one piece, bounded so the arena lock is not held long.
+                constexpr uint64_t kRunGap = uint64_t{64} << 10;
+                constexpr uint64_t kRunMax = uint64_t{4} << 20;
+                for (size_t i = 0; i < flush_storage_job_count_;) {
+                    const uint64_t lo = flush_storage_jobs_[i].cpu;
+                    uint64_t hi = lo + flush_storage_jobs_[i].size;
+                    size_t end = i + 1;
+                    while (end < flush_storage_job_count_) {
+                        const StorageHashJob& next = flush_storage_jobs_[end];
+                        if (next.cpu < lo || next.cpu > hi + kRunGap) {
+                            break;
+                        }
+                        const uint64_t next_hi = std::max(hi, next.cpu + next.size);
+                        if (next_hi - lo > kRunMax) {
+                            break;
+                        }
+                        hi = next_hi;
+                        ++end;
+                    }
+                    for (size_t k = i; k < end; ++k) {
+                        StorageHashJob& job = flush_storage_jobs_[k];
+                        job.host = 0;
+                        job.read_ok = false;
+                        job.changed = false;
+                    }
+                    bool done = false;
+                    if (end - i > 1 && lo != 0) {
+                        const com::GuestRangeView view(lo, static_cast<size_t>(hi - lo));
                         if (view.data() != nullptr) {
-                            job.host = reinterpret_cast<uintptr_t>(view.data());
-                            job.read_ok = true;
-                            job.hash = content_hash(view.data(), static_cast<size_t>(job.size));
-                            job.changed = !job.ever_uploaded || job.hash != job.last_hash;
-                            if (job.changed) {
-                                job.bytes.assign(view.data(), view.data() + job.size);
+                            for (size_t k = i; k < end; ++k) {
+                                StorageHashJob& job = flush_storage_jobs_[k];
+                                hash_job(job, view.data() + (job.cpu - lo));
+                            }
+                            done = true;
+                        }
+                    }
+                    for (size_t k = i; k < end && !done; ++k) {
+                        StorageHashJob& job = flush_storage_jobs_[k];
+                        {
+                            const com::GuestRangeView view(job.cpu, static_cast<size_t>(job.size));
+                            if (view.data() != nullptr) {
+                                hash_job(job, view.data());
+                            }
+                        }
+                        if (job.host == 0) {
+                            job.bytes.resize(static_cast<size_t>(job.size));
+                            job.read_ok = read_guest_best_effort(job.cpu, job.bytes.data(), job.bytes.size());
+                            if (job.read_ok) {
+                                job.hash = content_hash(job.bytes.data(), job.bytes.size());
+                                job.changed = !job.ever_uploaded || job.hash != job.last_hash;
+                                if (job.changed) {
+                                    encode_job(job, job.bytes.data());
+                                }
                             }
                         }
                     }
-                    if (job.host == 0) {
-                        job.bytes.resize(static_cast<size_t>(job.size));
-                        job.read_ok = read_guest_best_effort(job.cpu, job.bytes.data(), job.bytes.size());
-                        if (job.read_ok) {
-                            job.hash = content_hash(job.bytes.data(), job.bytes.size());
-                            job.changed = !job.ever_uploaded || job.hash != job.last_hash;
-                        }
-                    }
-                    if (job.changed) {
-                        job.bytes.resize(static_cast<size_t>(align_up(job.size, 4u)), 0);
-                    }
+                    i = end;
                 }
                 lock.lock();
                 for (size_t i = 0; i < flush_storage_job_count_; ++i) {
@@ -3179,6 +3240,14 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                     const auto it = storage_relocations_.find(RelocatedStorageKey{job.va, job.size, job.dedicated});
                     if (it == storage_relocations_.end() || &it->second != job.entry ||
                         it->second.created_epoch != job.created_epoch) {
+                        // Its home may belong to another range by now: drop the packets encoded for it.
+                        for (size_t at = job.packets_begin; at < job.packets_end;) {
+                            GpuPacketHeader header{};
+                            std::memcpy(&header, encoder.data() + at, sizeof(header));
+                            header.opcode = static_cast<uint16_t>(GpuOpcode::Nop);
+                            encoder.patch(at, &header, sizeof(header));
+                            at += sizeof(header) + header.payload_bytes;
+                        }
                         continue;
                     }
                     RelocatedStorage& r = it->second;
@@ -3189,8 +3258,6 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                         r.last_hash = job.hash;
                         r.ever_uploaded = true;
                         job.upload = true;
-                        job.buffer_id = r.buffer_id;
-                        job.offset = r.offset;
                     }
                     reindex_storage(r, job.read_ok ? job.host : 0, false, job.upload);
                 }
@@ -3205,19 +3272,14 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             count_work(Work::FlushStorageSkipped, storage_skipped);
         }
     }
-    // The changed ranges hashed without the lock. A home handed to another range after this point is
-    // the same case as on the locked path (whose packets were encoded but not yet submitted either).
+    // The changed ranges hashed without the lock (their packets are encoded already). A home handed to
+    // another range after this point is the same case as on the locked path (whose packets were encoded
+    // but not yet submitted either).
     for (size_t i = 0; i < flush_storage_job_count_; ++i) {
         StorageHashJob& job = flush_storage_jobs_[i];
         if (job.upload) {
-            const uint64_t write_len = job.bytes.size();
-            for (uint64_t off = 0; off < write_len; off += kMaxWriteChunk) {
-                const uint64_t n = std::min<uint64_t>(kMaxWriteChunk, write_len - off);
-                encoder.write_buffer(job.buffer_id, static_cast<uint32_t>(job.offset + off), job.bytes.data() + off,
-                                     static_cast<uint32_t>(n));
-            }
             count_work(Work::BufferUploads);
-            note_upload(write_len);
+            note_upload(align_up(job.size, 4u));
         }
         if (job.bytes.capacity() > (size_t{1} << 20)) {
             std::vector<uint8_t>().swap(job.bytes);  // the slots are reused: do not keep large copies
